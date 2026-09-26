@@ -41,7 +41,12 @@ app = FastAPI(title='Traffic Video Analysis API')
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=['*'],
+    allow_origins=[
+        "http://localhost:3000",
+        "https://wiut-cv-site-mnyjxya8d-gama-core.vercel.app",
+    ],
+    allow_origin_regex=r"https://wiut-cv-site.*\.vercel\.app",
+    allow_credentials=True,
     allow_methods=['*'],
     allow_headers=['*'],
 )
