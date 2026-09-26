@@ -1,0 +1,6 @@
+ultralytics>=8.3.35
+torch>=2.4.0
+torchvision>=0.25.0
+opencv-python>=4.10.0
+numpy>=1.26.4
+pandas>=2.2.2
