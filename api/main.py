@@ -65,6 +65,24 @@ def root():
 def health():
     return {'status': 'healthy'}
 
+@app.get('/api/samples')
+def samples():
+    """Заглушка для Sample Videos секции на сайте."""
+    return [
+        {
+            "id": f"sample-{n}",
+            "title": f"Sample 0{n}",
+            "videoUrl": None,
+            "duration": "60s",
+            "resolution": "1280x720",
+            "fps": "30",
+            "events": [],
+            "annotatedVideoUrl": None,
+            "mock": True,
+        }
+        for n in (1, 2, 3)
+    ]
+
 
 @app.post('/api/analyze')
 async def analyze(video: UploadFile = File(...)):
