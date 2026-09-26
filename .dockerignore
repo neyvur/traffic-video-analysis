@@ -1,0 +1,36 @@
+# Git
+.git/
+.gitignore
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Большие файлы и медиа
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.pdf
+
+# Ненужные для backend файлы
+notebooks/
+predictions*.json
+Sure.pdf
+README.md.save
+annotate_zones.py
+visualize.py
+evaluate.py
+run_submission.py
+
+# OS
+.DS_Store
+
+# Статика (аннотированные видео — удаляются при старте)
+api/static/*.mp4

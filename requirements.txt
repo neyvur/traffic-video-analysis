@@ -1,6 +1,15 @@
+# --- ML / Vision ---
 ultralytics>=8.3.35
 torch>=2.4.0
 torchvision>=0.25.0
 opencv-python>=4.10.0
 numpy>=1.26.4
 pandas>=2.2.2
+
+# --- FastAPI backend ---
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+
+# --- Utils ---
+python-dotenv>=1.0.0
