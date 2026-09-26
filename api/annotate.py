@@ -102,24 +102,54 @@ def process_video_annotated(video_path, output_path, zones_path='zones.json',
     tl_det = TrafficLightDetector(frame_rate=fps, zones_path=zones_path)
 
     # Зоны
+        # --- Загрузка и масштабирование зон ---
+    # zones.json размечен для REF_W × REF_H. Если входное видео
+    # другого разрешения — пропорционально масштабируем все координаты.
+    REF_W, REF_H = 1280, 720
+
+    cap0 = cv2.VideoCapture(video_path)
+    W = int(cap0.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H = int(cap0.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap0.release()
+    sx = W / REF_W
+    sy = H / REF_H
+    print(f"[zones] video {W}x{H}, scale={sx:.3f}x{sy:.3f}")
+
+    def _scale_pts(pts):
+        return [[int(p[0] * sx), int(p[1] * sy)] for p in pts]
+
     zones = {'stop_lines': [], 'crosswalk_zones': [], 'solid_lines': [],
-             'traffic_lights': []}
+             'no_stop_zones': [], 'traffic_lights': []}
     if os.path.exists(zones_path):
         with open(zones_path) as f:
             z = json.load(f)
-        zones['stop_lines'] = [(tuple(l[0]), tuple(l[1]))
-                               for l in z.get('stop_lines', [])]
-        zones['crosswalk_zones'] = list(z.get('crosswalk_zones', []))
-        zones['solid_lines'] = [(tuple(l[0]), tuple(l[1]))
-                                for l in z.get('solid_lines', [])]
+
+        # Линии: [[[x1,y1],[x2,y2]], ...]
+        for line in z.get('stop_lines', []):
+            zones['stop_lines'].append((tuple(_scale_pts(line)[0]),
+                                        tuple(_scale_pts(line)[1])))
+        for line in z.get('solid_lines', []):
+            zones['solid_lines'].append((tuple(_scale_pts(line)[0]),
+                                         tuple(_scale_pts(line)[1])))
+
+        # Полигоны: [[[x,y], ...], ...]
+        for poly in z.get('crosswalk_zones', []):
+            zones['crosswalk_zones'].append(_scale_pts(poly))
+        for poly in z.get('no_stop_zones', []):
+            zones['no_stop_zones'].append(_scale_pts(poly))
+
+        # BBox светофоров: [[x1,y1,x2,y2], ...]
         for tl in z.get('traffic_lights', []):
             if isinstance(tl, dict) and 'bbox' in tl:
                 b = tl['bbox']
-                zones['traffic_lights'].append(
-                    [int(b[0]), int(b[1]), int(b[2]), int(b[3])])
             elif isinstance(tl, list) and len(tl) == 4:
-                zones['traffic_lights'].append(
-                    [int(tl[0]), int(tl[1]), int(tl[2]), int(tl[3])])
+                b = tl
+            else:
+                continue
+            zones['traffic_lights'].append([
+                int(b[0] * sx), int(b[1] * sy),
+                int(b[2] * sx), int(b[3] * sy),
+            ])
 
     state = defaultdict(lambda: {
         'positions': [], 'last_violation_t': None, 'violation_type': '',
