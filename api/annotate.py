@@ -3,10 +3,10 @@ api/annotate.py — прогон пайплайна с записью аннот
 
 Функция process_video_annotated():
   - YOLO + ByteTrack
-  - RulesEngine + EventsDetector
+  - RulesEngine + EventsDetector + RiskEstimator
   - Рисует bbox, track_id, события, светофор
   - Пишет в output_path
-  - Возвращает список событий [[start, end, type], ...]
+  - Возвращает (events, risk_scores)
 """
 import os
 import json
@@ -18,6 +18,7 @@ from ultralytics import YOLO
 from src.tracker import ByteTrack
 from src.rules import RulesEngine
 from src.events import EventsDetector
+from src.risk import RiskEstimator
 from src.traffic_light import TrafficLightDetector
 
 
@@ -32,6 +33,10 @@ C_UNKNOWN   = (180, 180, 180)
 VEHICLE_CLASSES = {'car', 'truck', 'bus', 'motorcycle', 'bicycle'}
 PED_CLASSES = {'person', 'pedestrian'}
 
+
+# =====================================================================
+# Геометрия
+# =====================================================================
 
 def segments_intersect(p1, p2, p3, p4):
     def ccw(A, B, C):
@@ -79,9 +84,19 @@ def bbox_intersects_polygon(bbox, poly):
     return False
 
 
+# =====================================================================
+# Основная функция
+# =====================================================================
+
 def process_video_annotated(video_path, output_path, zones_path='zones.json',
                             conf_thres=0.25):
-    """Прогон + запись аннотированного видео. Возвращает events list."""
+    """Прогон + запись аннотированного видео.
+
+    Returns:
+        (events, risk_scores)
+        events:      [[start, end, type], ...]
+        risk_scores: [(t_sec, risk), ...]
+    """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open {video_path}")
@@ -90,55 +105,58 @@ def process_video_annotated(video_path, output_path, zones_path='zones.json',
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    # VideoWriter — mp4v
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    # VideoWriter — H.264 (avc1) для воспроизведения в Chrome/Firefox
+    fourcc = cv2.VideoWriter_fourcc(*'avc1')
     writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+    if not writer.isOpened():
+        print("[annotate] avc1 not available, falling back to mp4v")
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
 
     # Модели
     yolo = YOLO('weights/model.pt')
     tracker = ByteTrack(yolo=yolo, frame_rate=fps, conf_thres=conf_thres)
-    rules = RulesEngine(frame_rate=fps, zones_path=zones_path)
-    events_det = EventsDetector(frame_rate=fps)
+    risk_estimator = RiskEstimator(frame_rate=fps)
+    # Congestion отключён (слишком много ложных на тестовых видео)
+    rules = RulesEngine(
+        frame_rate=fps,
+        zones_path=zones_path,
+        risk_estimator=risk_estimator,
+        congestion_vehicle_count=999,
+        congestion_speed_thresh=0.1,
+    )
+    events_det = EventsDetector(
+        frame_rate=fps,
+        risk_estimator=risk_estimator,
+        congestion_vehicle_count=999,
+        congestion_avg_speed_thresh=0.1,
+    )
     tl_det = TrafficLightDetector(frame_rate=fps, zones_path=zones_path)
 
-    # Зоны
-        # --- Загрузка и масштабирование зон ---
-    # zones.json размечен для REF_W × REF_H. Если входное видео
-    # другого разрешения — пропорционально масштабируем все координаты.
+    # ---- Загрузка и масштабирование зон ----
+    # zones.json размечен для REF_W × REF_H. Для другого разрешения — масштабируем.
     REF_W, REF_H = 1280, 720
-
-    cap0 = cv2.VideoCapture(video_path)
-    W = int(cap0.get(cv2.CAP_PROP_FRAME_WIDTH))
-    H = int(cap0.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    cap0.release()
-    sx = W / REF_W
-    sy = H / REF_H
-    print(f"[zones] video {W}x{H}, scale={sx:.3f}x{sy:.3f}")
+    sx = w / REF_W
+    sy = h / REF_H
+    print(f"[zones] video {w}x{h}, scale={sx:.3f}x{sy:.3f}")
 
     def _scale_pts(pts):
         return [[int(p[0] * sx), int(p[1] * sy)] for p in pts]
 
     zones = {'stop_lines': [], 'crosswalk_zones': [], 'solid_lines': [],
-             'no_stop_zones': [], 'traffic_lights': []}
+             'traffic_lights': []}
     if os.path.exists(zones_path):
         with open(zones_path) as f:
             z = json.load(f)
 
-        # Линии: [[[x1,y1],[x2,y2]], ...]
         for line in z.get('stop_lines', []):
             zones['stop_lines'].append((tuple(_scale_pts(line)[0]),
                                         tuple(_scale_pts(line)[1])))
         for line in z.get('solid_lines', []):
             zones['solid_lines'].append((tuple(_scale_pts(line)[0]),
                                          tuple(_scale_pts(line)[1])))
-
-        # Полигоны: [[[x,y], ...], ...]
         for poly in z.get('crosswalk_zones', []):
             zones['crosswalk_zones'].append(_scale_pts(poly))
-        for poly in z.get('no_stop_zones', []):
-            zones['no_stop_zones'].append(_scale_pts(poly))
-
-        # BBox светофоров: [[x1,y1,x2,y2], ...]
         for tl in z.get('traffic_lights', []):
             if isinstance(tl, dict) and 'bbox' in tl:
                 b = tl['bbox']
@@ -151,13 +169,18 @@ def process_video_annotated(video_path, output_path, zones_path='zones.json',
                 int(b[2] * sx), int(b[3] * sy),
             ])
 
+    # Состояние треков для отрисовки
     state = defaultdict(lambda: {
-        'positions': [], 'last_violation_t': None, 'violation_type': '',
-        'stationary_start_t': None, 'crossed_stop': set(),
-        'crossed_stop_t': None, 'crossed_solid': set(),
+        'positions': [],
+        'last_violation_t': None,
+        'violation_type': '',
+        'stationary_start_t': None,
+        'crossed_stop': set(),
+        'crossed_solid': set(),
     })
 
     events_dict = {}
+    risk_scores = []
 
     frame_idx = 0
     t_sec = 0.0
@@ -168,73 +191,52 @@ def process_video_annotated(video_path, output_path, zones_path='zones.json',
                 break
             t_sec = frame_idx / fps
 
+            # 1. Track (YOLO + ByteTrack)
             tracks = tracker.update(frame)
-            detections = [{'bbox': t['bbox'], 'class': t['class'],
-                           'confidence': t['confidence']} for t in tracks]
+            detections = [
+                {'bbox': t['bbox'], 'class': t['class'],
+                 'confidence': t['confidence']}
+                for t in tracks
+            ]
 
-            # светофор
-            tl_state = tl_det.update(frame, detections)
-            rules.set_traffic_light(tl_state)
+            # 2. Светофор
+            try:
+                tl_state = tl_det.update(frame, detections)
+                rules.set_traffic_light(tl_state)
+            except Exception:
+                tl_state = 'unknown'
 
             fi = {'frame_idx': frame_idx, 't_sec': t_sec}
+
+            # 3. Rules
             try:
                 rule_events = rules.process_frame(tracks, detections, fi)
-            except Exception:
+            except Exception as e:
+                if frame_idx % 300 == 0:
+                    print(f"[rules] {type(e).__name__}: {e}")
                 rule_events = []
+
+            # 4. Events
             try:
-                ev_events = events_det.process_frame(tracks, detections, fi)
+                event_events = events_det.process_frame(tracks, detections, fi)
+            except Exception as e:
+                if frame_idx % 300 == 0:
+                    print(f"[events] {type(e).__name__}: {e}")
+                event_events = []
+
+            # 5. Risk
+            try:
+                risk_score = risk_estimator.step(frame, t_sec)
             except Exception:
-                ev_events = []
+                risk_score = 0.0
+            risk_scores.append((t_sec, float(risk_score)))
 
-            for ev in list(rule_events) + list(ev_events):
-                if len(ev) == 3:
-                    s, e, et = ev
-                    events_dict.setdefault(et, []).append([float(s), float(e)])
-
-            # --- Локальная логика для отрисовки ---
-            for tr in tracks:
-                tid = tr['track_id']
-                bbox = tr['bbox']
-                cls = tr.get('class', '').lower()
-                cx = (bbox[0] + bbox[2]) / 2.0
-                cy = (bbox[1] + bbox[3]) / 2.0
-                st = state[tid]
-                st['positions'].append((cx, cy))
-                if len(st['positions']) > 120:
-                    st['positions'] = st['positions'][-120:]
-
-                if len(st['positions']) >= int(fps):
-                    recent = st['positions'][-int(fps):]
-                    xs = [p[0] for p in recent]
-                    ys = [p[1] for p in recent]
-                    motion = (max(xs) - min(xs)) + (max(ys) - min(ys))
-                    if motion < 8.0:
-                        if st['stationary_start_t'] is None:
-                            st['stationary_start_t'] = t_sec
-                    else:
-                        st['stationary_start_t'] = None
-                else:
-                    st['stationary_start_t'] = None
-
-                if cls in VEHICLE_CLASSES and len(st['positions']) >= 2:
-                    p_prev = st['positions'][-2]
-                    p_curr = st['positions'][-1]
-                    for idx, (A, B) in enumerate(zones['stop_lines']):
-                        if idx in st['crossed_stop']:
-                            continue
-                        if segments_intersect(p_prev, p_curr, A, B):
-                            st['crossed_stop'].add(idx)
-                            st['crossed_stop_t'] = t_sec
-                            if tl_state == 'red':
-                                st['last_violation_t'] = t_sec
-                                st['violation_type'] = 'RED LIGHT'
-                    for idx, (A, B) in enumerate(zones['solid_lines']):
-                        if idx in st['crossed_solid']:
-                            continue
-                        if segments_intersect(p_prev, p_curr, A, B):
-                            st['crossed_solid'].add(idx)
-                            st['last_violation_t'] = t_sec
-                            st['violation_type'] = 'SOLID LINE'
+            # 6. Collect
+            for ev in list(rule_events) + list(event_events):
+                if len(ev) != 3:
+                    continue
+                s, e, et = ev
+                events_dict.setdefault(et, []).append([float(s), float(e)])
 
             # --- Отрисовка ---
             overlay = frame.copy()
@@ -247,6 +249,18 @@ def process_video_annotated(video_path, output_path, zones_path='zones.json',
                 cv2.line(overlay, A, B, (255, 0, 255), 4)
             frame = cv2.addWeighted(overlay, 0.25, frame, 0.75, 0)
 
+            # Обновление состояния для отрисовки
+            for tr in tracks:
+                tid = tr['track_id']
+                bbox = tr['bbox']
+                cls = tr.get('class', '').lower()
+                cx = (bbox[0] + bbox[2]) / 2.0
+                cy = (bbox[1] + bbox[3]) / 2.0
+                st = state[tid]
+                st['positions'].append((cx, cy))
+                if len(st['positions']) > 120:
+                    st['positions'] = st['positions'][-120:]
+
             for tr in tracks:
                 x1, y1, x2, y2 = tr['bbox']
                 cls = tr.get('class', '').lower()
@@ -256,19 +270,9 @@ def process_video_annotated(video_path, output_path, zones_path='zones.json',
                            (t_sec - st['last_violation_t']) < 5.0)
 
                 if cls in VEHICLE_CLASSES:
-                    if is_viol:
-                        color = C_VIOLATION
-                        label = f"#{tid} {cls} {st['violation_type']}"
-                        thick = 3
-                    elif (st['stationary_start_t'] is not None and
-                          (t_sec - st['stationary_start_t']) >= 2.0):
-                        color = C_STOPPED
-                        label = f"#{tid} {cls} STOPPED"
-                        thick = 2
-                    else:
-                        color = C_OK
-                        label = f"#{tid} {cls}"
-                        thick = 2
+                    color = C_VIOLATION if is_viol else C_OK
+                    label = f"#{tid} {cls}"
+                    thick = 3 if is_viol else 2
                 elif cls in PED_CLASSES:
                     cx = (x1 + x2) / 2.0
                     cy = (y1 + y2) / 2.0
@@ -286,14 +290,14 @@ def process_video_annotated(video_path, output_path, zones_path='zones.json',
                 cv2.putText(frame, label, (x1, max(18, y1 - 8)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
 
-            # Светофор из zones.json
+            # Светофор
+            tl_colors = {'red': (0, 0, 255), 'yellow': (0, 215, 255),
+                         'green': (0, 220, 0)}
             for bbox in zones['traffic_lights']:
                 x1, y1, x2, y2 = bbox
-                c = {'red': (0, 0, 255), 'yellow': (0, 215, 255),
-                     'green': (0, 220, 0)}.get(tl_state, (180, 180, 180))
+                c = tl_colors.get(tl_state, (180, 180, 180))
                 cv2.rectangle(frame, (x1, y1), (x2, y2), c, 4)
 
-            # Плашка с временем
             cv2.putText(frame, f"t={t_sec:5.1f}s  frame={frame_idx}",
                         (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                         (255, 255, 255), 2, cv2.LINE_AA)
@@ -301,7 +305,7 @@ def process_video_annotated(video_path, output_path, zones_path='zones.json',
             writer.write(frame)
             frame_idx += 1
 
-        # Закрытие открытых
+        # Финализация
         try:
             for ev in rules.finalize(t_sec):
                 if len(ev) == 3:
@@ -337,4 +341,5 @@ def process_video_annotated(video_path, output_path, zones_path='zones.json',
         for s, e in merged:
             final_events.append([s, e, et])
     final_events.sort(key=lambda x: (x[0], x[2]))
-    return final_events
+
+    return final_events, risk_scores

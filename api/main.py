@@ -14,7 +14,6 @@ sys.path.insert(0, str(ROOT))
 
 from api.annotate import process_video_annotated  # noqa: E402
 
-# Папка для аннотированных видео
 STATIC_DIR = ROOT / 'api' / 'static'
 STATIC_DIR.mkdir(exist_ok=True)
 
@@ -52,7 +51,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Раздаём статику (аннотированные видео)
 app.mount('/static', StaticFiles(directory=str(STATIC_DIR)), name='static')
 
 
@@ -65,9 +63,9 @@ def root():
 def health():
     return {'status': 'healthy'}
 
+
 @app.get('/api/samples')
 def samples():
-    """Заглушка для Sample Videos секции на сайте."""
     return [
         {
             "id": f"sample-{n}",
@@ -85,34 +83,31 @@ def samples():
 
 
 @app.post('/api/analyze')
-async def analyze(video: UploadFile = File(...)):
+def analyze(video: UploadFile = File(...)):
+    """Sync endpoint — не блокирует event loop."""
     if not video.filename:
         raise HTTPException(400, 'No filename')
 
-    # Сохраняем загруженное видео
     suffix = os.path.splitext(video.filename)[1] or '.mp4'
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         try:
             shutil.copyfileobj(video.file, tmp)
         finally:
-            await video.close()
+            video.file.close()
         tmp_path = tmp.name
 
-    # Имя для выходного аннотированного видео
     job_id = uuid.uuid4().hex
     annotated_path = STATIC_DIR / f'{job_id}.mp4'
 
     try:
         zones_path = str(ROOT / 'zones.json')
 
-        # Прогон + запись видео
-        events = process_video_annotated(
+        events, risk_scores = process_video_annotated(
             tmp_path,
             str(annotated_path),
             zones_path=zones_path,
         )
 
-        # Мета
         import cv2
         cap = cv2.VideoCapture(tmp_path)
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -132,7 +127,10 @@ async def analyze(video: UploadFile = File(...)):
 
         return {
             'events': site_events,
-            'risk': [],  # зарезервировано — можно добавить risk из нашего пайплайна
+            'risk': [
+                {'time': float(t), 'score': float(r)}
+                for t, r in risk_scores
+            ],
             'meta': {
                 'durationSec': round(n / fps, 2) if fps else None,
                 'fps': round(fps, 2),

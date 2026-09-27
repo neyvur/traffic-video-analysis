@@ -27,6 +27,18 @@ The system processes a road video and returns a list of detected events with acc
 | 13 | `obstacle_on_road` | Static obstacle on the road |
 | 14 | `fire_smoke` | Fire or smoke detected |
 
+### ⚠️ Detection limitations
+
+- **12 of 14 event classes** can trigger with the default YOLOv8n (COCO) model.
+- **`fire_smoke`** requires a custom-trained model — COCO has no fire/smoke 
+  classes, so this event will not fire with default weights.
+- **`obstacle_on_road`** is implemented but rarely triggers because the tracker 
+  only accepts COCO traffic classes. In practice it will only fire for 
+  unusual objects YOLO happens to detect outside the vehicle set.
+- Camera-specific zones (`zones.json`) must be re-annotated for each new 
+  fixed camera — they are not portable across viewpoints.
+
+
 ### Bonus — Continuous risk estimation
 
 For every frame the system returns a risk score between `0.0` (very low) and `1.0` (very high), enabling accident anticipation up to ~5 seconds before impact.
